@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: ping-pong
+  namespace: default
+  labels:
+    app: ping-pong
+spec:
+  type: ClusterIP
+  selector:
+    app: ping-pong
+  ports:
+    - port: 80
+      targetPort: 8080
+      protocol: TCP

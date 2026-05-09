@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ping-pong-config
+  namespace: default
+data:
+  PORT: "8080"
