@@ -9,34 +9,15 @@ jobs:
   validate-title:
     name: Validate PR Title
     runs-on: ubuntu-latest
-    permissions:
-      statuses: write
     steps:
       - name: Check conventional commit prefix
         env:
           PR_TITLE: ${{ github.event.pull_request.title }}
-          SHA: ${{ github.event.pull_request.head.sha }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPO: ${{ github.repository }}
         run: |
-          if echo "$PR_TITLE" | grep -qE '^(feat|fix|chore|docs|style|refactor|test|perf|ci|build|revert)(\(.+\))?(!)?: .+'; then
-            STATE=success
-            DESCRIPTION="PR title follows conventional commits format"
-          else
-            STATE=failure
-            DESCRIPTION="PR title must start with: feat|fix|chore|docs|style|refactor|test|perf|ci|build|revert"
-          fi
-
-          gh api repos/${REPO}/statuses/${SHA} \
-            --method POST \
-            --field state="${STATE}" \
-            --field description="${DESCRIPTION}" \
-            --field context="pr-title-check"
-
-          if [ "$STATE" = "failure" ]; then
+          if ! echo "$PR_TITLE" | grep -qE '^(feat|fix|chore|docs|style|refactor|test|perf|ci|build|revert)(\(.+\))?(!)?: .+'; then
             echo "Invalid PR title: '$PR_TITLE'"
+            echo "Title must follow conventional commits format."
             echo "Examples: 'feat: add login', 'fix(auth): token expiry', 'chore!: drop Go 1.21'"
             exit 1
           fi
-
           echo "PR title is valid: '$PR_TITLE'"
