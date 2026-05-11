@@ -16,6 +16,8 @@ jobs:
       contents: read
       packages: write
       security-events: write
+      pull-requests: write
+      pull-requests: write
 
     steps:
       - name: Checkout
@@ -81,3 +83,39 @@ jobs:
         with:
           name: trivy-results
           path: trivy-results.sarif
+
+      - name: Post Trivy results as PR comment
+        if: always()
+        env:
+          TRIVY_USERNAME: ${{ github.actor }}
+          TRIVY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          trivy image \
+            --format table \
+            --severity CRITICAL,HIGH \
+            --ignore-unfixed \
+            --exit-code 0 \
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:pr-${{ github.event.number }} \
+            > trivy-table.txt 2>&1 || true
+
+          TABLE=$(cat trivy-table.txt)
+          if echo "$TABLE" | grep -qE "CRITICAL|HIGH"; then
+            HEADER="### Trivy Security Scan - Vulnerabilities Found"
+          else
+            HEADER="### Trivy Security Scan - Clean"
+          fi
+
+          BODY="${HEADER}
+
+          \`\`\`
+          ${TABLE:-No vulnerabilities found.}
+          \`\`\`"
+
+          gh pr comment ${{ github.event.number }} \
+            --repo ${{ github.repository }} \
+            --body "$BODY" \
+            --edit-last 2>/dev/null || \
+          gh pr comment ${{ github.event.number }} \
+            --repo ${{ github.repository }} \
+            --body "$BODY"
