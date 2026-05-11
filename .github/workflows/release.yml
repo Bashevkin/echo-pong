@@ -7,39 +7,19 @@ on:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
 
 jobs:
-  tag:
-    name: Create Tag
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-
-    outputs:
-      version: ${{ steps.bump.outputs.new_tag }}
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Bump version based on commit message
-        id: bump
-        uses: mathieudutour/github-tag-action@v6.2
-        with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          default_bump: patch
-          tag_prefix: v
-
-  build-and-push:
-    name: Build, Push & Scan
-    needs: tag
+  build-and-scan:
+    name: Build & Scan
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
       security-events: write
+
+    outputs:
+      sha-tag: ${{ steps.sha.outputs.short }}
 
     steps:
       - name: Checkout
@@ -47,6 +27,10 @@ jobs:
 
       - name: Set lowercase image name
         run: echo "IMAGE_NAME=$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> $GITHUB_ENV
+
+      - name: Compute short SHA
+        id: sha
+        run: echo "short=${GITHUB_SHA::7}" >> $GITHUB_OUTPUT
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -61,31 +45,20 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract image metadata
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          tags: |
-            type=raw,value=latest
-            type=raw,value=${{ needs.tag.outputs.version }}
-            type=sha,prefix=sha-,format=short
-
-      - name: Build and push
+      - name: Build and push (SHA tag)
         uses: docker/build-push-action@v6
         with:
           context: .
           platforms: linux/amd64,linux/arm64
           push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.sha.outputs.short }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
       - name: Run Trivy vulnerability scan
         uses: aquasecurity/trivy-action@master
         with:
-          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.tag.outputs.version }}
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.sha.outputs.short }}
           format: sarif
           output: trivy-results.sarif
           severity: CRITICAL,HIGH
@@ -97,7 +70,7 @@ jobs:
 
       - name: Upload Trivy results to GitHub Security
         if: always()
-        uses: github/codeql-action/upload-sarif@v3
+        uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: trivy-results.sarif
 
@@ -108,9 +81,66 @@ jobs:
           name: trivy-results
           path: trivy-results.sarif
 
+  semantic-release:
+    name: Semantic Release
+    needs: build-and-scan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+
+    outputs:
+      new_release_published: ${{ steps.release.outputs.new_release_published }}
+      new_release_version: ${{ steps.release.outputs.new_release_version }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Semantic Release
+        id: release
+        uses: cycjimmy/semantic-release-action@v4
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  promote-image:
+    name: Promote Image
+    needs: [build-and-scan, semantic-release]
+    if: needs.semantic-release.outputs.new_release_published == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+
+    steps:
+      - name: Set lowercase image name
+        run: echo "IMAGE_NAME=$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> $GITHUB_ENV
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Re-tag image with version and latest
+        run: |
+          SOURCE=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.build-and-scan.outputs.sha-tag }}
+          VERSION=v${{ needs.semantic-release.outputs.new_release_version }}
+          docker buildx imagetools create \
+            --tag ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${VERSION} \
+            --tag ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest \
+            ${SOURCE}
+
   build-binaries:
     name: Build Binaries
-    needs: tag
+    needs: semantic-release
+    if: needs.semantic-release.outputs.new_release_published == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -122,6 +152,10 @@ jobs:
             goarch: amd64
           - goos: linux
             goarch: arm64
+          - goos: darwin
+            goarch: amd64
+          - goos: darwin
+            goarch: arm64
 
     steps:
       - name: Checkout
@@ -131,6 +165,7 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+          cache: false
 
       - name: Build binary
         env:
@@ -146,9 +181,10 @@ jobs:
           name: ping-pong-app-${{ matrix.goos }}-${{ matrix.goarch }}
           path: ping-pong-app-${{ matrix.goos }}-${{ matrix.goarch }}
 
-  github-release:
-    name: Create GitHub Release
-    needs: [tag, build-and-push, build-binaries]
+  upload-assets:
+    name: Upload Release Assets
+    needs: [semantic-release, build-binaries]
+    if: needs.semantic-release.outputs.new_release_published == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -159,18 +195,12 @@ jobs:
         with:
           path: artifacts
           merge-multiple: true
+          pattern: ping-pong-app-*
 
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ needs.tag.outputs.version }}
-          generate_release_notes: true
-          files: artifacts/*
-          body: |
-            ## Container Image
-
-            ```
-            docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.tag.outputs.version }}
-            ```
-
-            Multi-arch image supports `linux/amd64` and `linux/arm64`.
+      - name: Upload binaries to GitHub Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload v${{ needs.semantic-release.outputs.new_release_version }} \
+            artifacts/* \
+            --repo ${{ github.repository }}

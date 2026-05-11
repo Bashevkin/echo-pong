@@ -7,6 +7,7 @@ on:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
 
 jobs:
   build-and-push:
@@ -16,6 +17,7 @@ jobs:
       contents: read
       packages: write
       security-events: write
+      pull-requests: write
 
     steps:
       - name: Checkout
@@ -44,6 +46,7 @@ jobs:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
             type=ref,event=pr
+            type=sha,format=short,prefix=
 
       - name: Build and push
         uses: docker/build-push-action@v6
@@ -71,7 +74,7 @@ jobs:
 
       - name: Upload Trivy results to GitHub Security
         if: always()
-        uses: github/codeql-action/upload-sarif@v3
+        uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: trivy-results.sarif
 
@@ -81,3 +84,81 @@ jobs:
         with:
           name: trivy-results
           path: trivy-results.sarif
+
+      - name: Post Trivy results as PR comment
+        if: always()
+        env:
+          TRIVY_USERNAME: ${{ github.actor }}
+          TRIVY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          trivy image \
+            --format table \
+            --severity CRITICAL,HIGH \
+            --ignore-unfixed \
+            --exit-code 0 \
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:pr-${{ github.event.number }} \
+            > trivy-table.txt 2>&1 || true
+
+          TABLE=$(cat trivy-table.txt)
+          if echo "$TABLE" | grep -qE "CRITICAL|HIGH"; then
+            HEADER="### Trivy Security Scan - Vulnerabilities Found"
+          else
+            HEADER="### Trivy Security Scan - Clean"
+          fi
+
+          BODY="${HEADER}
+
+          \`\`\`
+          ${TABLE:-No vulnerabilities found.}
+          \`\`\`"
+
+          gh pr comment ${{ github.event.number }} \
+            --repo ${{ github.repository }} \
+            --body "$BODY" \
+            --edit-last 2>/dev/null || \
+          gh pr comment ${{ github.event.number }} \
+            --repo ${{ github.repository }} \
+            --body "$BODY"
+
+  build-binaries:
+    name: Build Binaries
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    strategy:
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+          - goos: darwin
+            goarch: amd64
+          - goos: darwin
+            goarch: arm64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Build binary
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "0"
+        run: go build -o ping-pong-app-${{ matrix.goos }}-${{ matrix.goarch }} .
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ping-pong-app-pr${{ github.event.number }}-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: ping-pong-app-${{ matrix.goos }}-${{ matrix.goarch }}
+          retention-days: 7
